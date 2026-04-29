@@ -44,91 +44,90 @@ let sstHeatmapLayer = null  // 后端驱动的热力图图层
 // ==================== 加载海温距平热力图 ====================
 // ==================== 加载海温距平热力图（最终版） ====================
 // ==================== 加载全距平热力图 ====================
+// ==================== 加载海温距平热力图 ====================
+let sstVisualLayer = null;
+
 async function loadSSTHeatmap(date) {
   try {
     const response = await axios.get('http://localhost:3000/api/sst/all', {
       params: { date }
-    })
-
-    const docs = response.data
+    });
+    const docs = response.data;
     if (!docs || docs.length === 0) {
-      if (sstHeatmapLayer) {
-        map.remove(sstHeatmapLayer)
-        sstHeatmapLayer = null
+      if (sstVisualLayer) {
+        map.remove(sstVisualLayer);
+        sstVisualLayer = null;
       }
-      return
+      return;
     }
 
-    // 1. 提取距平值并排序，用于计算分位数
-    const anomalies = docs.map(d => d.anomaly).sort((a, b) => a - b)
-    const n = anomalies.length
+    // 计算 5% - 95% 距平极值
+    const sorted = [...docs.map(d => d.anomaly)].sort((a, b) => a - b);
+    const n = sorted.length;
+    const minAnom = sorted[Math.floor(n * 0.05)];
+    const maxAnom = sorted[Math.floor(n * 0.95)];
 
-    // 2. 使用第 5 百分位作为下界，第 95 百分位作为上界（裁剪掉极端值，拉伸对比度）
-    const lowerIdx = Math.floor(n * 0.05)
-    const upperIdx = Math.floor(n * 0.95)
-    const minAnom = anomalies[lowerIdx]
-    const maxAnom = anomalies[upperIdx]
+    // 移除旧图层
+    if (sstVisualLayer) {
+      map.remove(sstVisualLayer);
+      sstVisualLayer = null;
+    }
 
-console.log(`[${date}] 距平范围(5%-95%): ${minAnom.toFixed(2)} ~ ${maxAnom.toFixed(2)}`)
+    // 1. 构建 GeoJSON（这里是点数据 Point）
+    const features = docs.map(d => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [d.lon, d.lat] },
+      properties: { anomaly: d.anomaly }
+    }));
+    
+    const geojson = { type: 'FeatureCollection', features };
+    const blob = new Blob([JSON.stringify(geojson)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
 
-// 移除旧图层
-if (sstHeatmapLayer) {
-  map.remove(sstHeatmapLayer)
-  sstHeatmapLayer = null
-}
-
-// 转换为 GeoJSON (保持不变)
-const features = docs.map(doc => ({
-  type: 'Feature',
-  geometry: { type: 'Point', coordinates: [doc.lon, doc.lat] },
-  properties: { anomaly: doc.anomaly }
-}))
-
-const geojson = { type: 'FeatureCollection', features }
-const blob = new Blob([JSON.stringify(geojson)], { type: 'application/json' })
-const url = URL.createObjectURL(blob)
-
-// 🚀 核心修改区：创建气象级的网格点渲染图层
-sstHeatmapLayer = new GeoJSONLayer({
-  url: url,
-  title: `海温距平 (${date})`,
-  
-  // 使用 SimpleRenderer 配合视觉变量
-  renderer: {
-    type: "simple",
-    symbol: {
-      type: "simple-marker",
-      // 如果你的数据是标准的方块网格，用 "square" 会拼成完美的像素风面状图
-      // 如果网格间距比较大，用 "circle" 也可以
-      style: "square", 
-      size: "12px", // ⚠️ 根据你的网格密度调整这个大小，让点刚好无缝拼接起来
-      outline: {
-        width: 0 // 必须去掉边框，否则密集的点全是边框线
-      }
-    },
-    // 🔥 核心：根据 anomaly 字段的值，动态赋予颜色
-    visualVariables: [
-      {
-        type: "color",
-        field: "anomaly",
-        // 让颜色严格映射到对应的距平值上
-        stops: [
-          { value: minAnom, color: [0, 0, 139, 0.85] },      // 极冷：深蓝
-          { value: minAnom / 2, color: [0, 180, 255, 0.7] }, // 偏冷：浅蓝
-          { value: 0, color: [255, 255, 255, 0.1] },         // 正常无距平：设为近乎透明，露出海底地形！
-          { value: maxAnom / 2, color: [255, 200, 0, 0.8] }, // 偏暖：橙黄
-          { value: maxAnom, color: [220, 20, 20, 0.9] }      // 极热(热浪)：深红
+    // 2. 创建特效图层
+    sstVisualLayer = new GeoJSONLayer({
+      url: url,
+      title: `海温距平 (${date})`,
+      
+      // ✨ 视觉魔法：blur 把点融化成云雾，bloom 增加质感
+      //effect: "blur(12px) bloom(1.2, 0.5px, 0.1)", 
+      //blendMode: "multiply", // 正片叠底，融入地图
+      
+      outFields: ['anomaly'],
+      popupTemplate: {
+        title: '气象监测详情',
+        content: '<b>海温距平：</b> {anomaly} °C'
+      },
+      
+      renderer: {
+        type: "simple",
+        symbol: {
+          // ⚠️ 极其关键：因为数据是 Point，这里必须是 marker！
+          type: "simple-marker", 
+          style: "square", // 用方块拼凑
+          size: "18px",    // 尺寸调大，让方块互相重叠，方便 blur 滤镜把它融化
+          outline: null    // 坚决不留边框
+        },
+        visualVariables: [
+          {
+            type: 'color',
+            field: 'anomaly',
+            stops: [
+              // 高级气象色标：深蓝 -> 透明 -> 绯红
+              { value: minAnom, color: [55, 95, 155, 0.7] },          // 冷：灰蓝
+              { value: (minAnom + maxAnom) / 2, color: [245, 245, 245, 0.08] }, // 中性：极淡
+              { value: maxAnom, color: [190, 35, 35, 0.75] }          // 热：暗红
+            ]
+          }
         ]
       }
-    ]
-  }
-})
+    });
 
-map.add(sstHeatmapLayer)
-    console.log(`[${date}] 已加载 ${features.length} 个格点`)
-    
+    map.add(sstVisualLayer);   
+
+    console.log(`[${date}] 气象图层已加载！范围: ${minAnom.toFixed(2)} ~ ${maxAnom.toFixed(2)}`);
   } catch (err) {
-    console.error('加载热力图失败:', err)
+    console.error('加载失败:', err);
   }
 }
 
