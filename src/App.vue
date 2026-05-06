@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, onMounted, reactive, ref, watch, nextTick } from 'vue'
+import { onBeforeUnmount, onMounted, reactive, ref, watch, nextTick, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   Monitor, House, MapLocation, Warning, Setting,
@@ -10,9 +10,15 @@ import EsriMap from '@arcgis/core/Map'
 import MapView from '@arcgis/core/views/MapView'
 import GeoJSONLayer from '@arcgis/core/layers/GeoJSONLayer'
 import * as echarts from 'echarts'
+import BufferAnalysis from './components/BufferAnalysis.vue'
+import ScientificAnalysis from './components/ScientificAnalysis.vue'
+import RiskAssessment from './components/RiskAssessment.vue'
 
 // ---------- 响应式变量 ----------
 const activeMenu = ref('monitor')
+const bufferAnalysisRef = ref(null)
+const scientificAnalysisRef = ref(null)
+const riskAssessmentRef = ref(null)
 const mapContainer = ref(null)
 const trendChartRef = ref(null)
 const selectedDate = ref('2025-08-01')
@@ -24,6 +30,41 @@ const layerControls = reactive({
 
 const currentFarmCenter = ref({ lat: 29.8, lon: 122.2 })
 const trendDialogVisible = ref(false)
+const farmCount = ref(0)
+const heatAlertCount = ref(0)
+const alertNewsList = ref([])
+const availableDates = ref([])
+const timeSliderValue = ref(0)
+const totalSliderDays = computed(() => availableDates.value.length)
+
+// ---------- 菜单选择处理 ----------
+function handleMenuSelect(index) {
+  activeMenu.value = index
+  if (index === 'analysis-1') {
+    // 点击"养殖区空间叠置"时，打开缓冲区分析面板
+    if (bufferAnalysisRef.value) {
+      bufferAnalysisRef.value.openPanel()
+    }
+  }
+  if (index === 'science-1') {
+    // 点击"冷热点分析"时，打开科学分析面板
+    if (scientificAnalysisRef.value) {
+      scientificAnalysisRef.value.openPanel('hotspot')
+    }
+  }
+  if (index === 'science-2') {
+    // 点击"等温线分析"时，打开科学分析面板
+    if (scientificAnalysisRef.value) {
+      scientificAnalysisRef.value.openPanel('isotherm')
+    }
+  }
+  if (index === 'analysis-3') {
+    // 点击"风险评估 & 报告导出"
+    if (riskAssessmentRef.value) {
+      riskAssessmentRef.value.openPanel()
+    }
+  }
+}
 
 // ---------- 地图相关 ----------
 let map = null
@@ -262,7 +303,7 @@ function bindMapClick() {
 
 // ---------- 地图初始化 ----------
 function initMap() {
-  map = new EsriMap({ basemap: 'topo-vector' })
+  map = new EsriMap({ basemap: 'oceans' })
   view = new MapView({
     container: mapContainer.value,
     map,
@@ -277,7 +318,9 @@ function initMap() {
   window.view = view
 
   bindMapClick()
+  initTimeSlider()
   loadSSTHeatmap(selectedDate.value)
+  loadStats(selectedDate.value)
 
   // 地图就绪后强制加载养殖区并聚焦
   view.when(() => {
@@ -285,8 +328,167 @@ function initMap() {
   })
 }
 
+// ---------- 热浪空间聚类 ----------
+function clusterHotPoints(hotPoints) {
+  if (hotPoints.length === 0) return []
+
+  const binSize = 1.0
+  const grid = new Map()
+  for (const p of hotPoints) {
+    const bx = Math.floor(p.lon / binSize)
+    const by = Math.floor(p.lat / binSize)
+    const key = `${bx}_${by}`
+    if (!grid.has(key)) grid.set(key, [])
+    grid.get(key).push(p)
+  }
+
+  const visited = new Set()
+  const clusters = []
+
+  for (const startKey of grid.keys()) {
+    if (visited.has(startKey)) continue
+
+    const cluster = []
+    const queue = [startKey]
+    visited.add(startKey)
+
+    while (queue.length > 0) {
+      const key = queue.shift()
+      const [bx, by] = key.split('_').map(Number)
+      const points = grid.get(key) || []
+      cluster.push(...points)
+
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          if (dx === 0 && dy === 0) continue
+          const nk = `${bx + dx}_${by + dy}`
+          if (grid.has(nk) && !visited.has(nk)) {
+            visited.add(nk)
+            queue.push(nk)
+          }
+        }
+      }
+    }
+
+    clusters.push(cluster)
+  }
+
+  return clusters
+}
+
+function generateDateRange(start, end) {
+  const dates = []
+  const cur = new Date(start)
+  const last = new Date(end)
+  while (cur <= last) {
+    dates.push(cur.toISOString().slice(0, 10))
+    cur.setDate(cur.getDate() + 1)
+  }
+  return dates
+}
+
+// ---------- 宏观统计数据加载 ----------
+async function loadStats(date) {
+  try {
+    // 并行请求：养殖区计数 + 热浪异常点
+    const [farmRes, sstRes] = await Promise.all([
+      axios.get('http://localhost:3000/api/farms/in-view', { params: { xmin: -180, ymin: -90, xmax: 180, ymax: 90 } }),
+      axios.get('http://localhost:3000/api/sst/all', { params: { date } })
+    ])
+
+    const geojson = farmRes.data
+    if (geojson?.features) {
+      farmCount.value = geojson.features.length
+    }
+
+    const docs = Array.isArray(sstRes.data) ? sstRes.data : []
+    const hotPoints = docs.filter(d => {
+      const a = Number(d?.anomaly)
+      return Number.isFinite(a) && a > 1.0
+    })
+
+    // 空间聚类：将相邻热点聚合成热浪事件
+    const clusters = clusterHotPoints(hotPoints)
+    heatAlertCount.value = clusters.length
+
+    // 生成预警摘要
+    const now = new Date()
+    const pad = n => String(n).padStart(2, '0')
+    const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`
+
+    const news = []
+    if (clusters.length > 0) {
+      // 按簇大小降序排列
+      clusters.sort((a, b) => b.length - a.length)
+      const maxCluster = clusters[0]
+      const avgLon = maxCluster.reduce((s, p) => s + p.lon, 0) / maxCluster.length
+      const avgLat = maxCluster.reduce((s, p) => s + p.lat, 0) / maxCluster.length
+      const maxAnom = Math.max(...maxCluster.map(p => p.anomaly))
+
+      news.push({
+        time: timeStr,
+        level: 'danger',
+        text: `全球共检测到 ${clusters.length} 个热浪事件（${hotPoints.length} 个异常网格点），最大事件覆盖 ${maxCluster.length} 个网格`
+      })
+      if (clusters.length >= 2) {
+        const second = clusters[1]
+        const sAvgLon = second.reduce((s, p) => s + p.lon, 0) / second.length
+        const sAvgLat = second.reduce((s, p) => s + p.lat, 0) / second.length
+        news.push({
+          time: timeStr,
+          level: 'warning',
+          text: `第二热浪事件中心 (${sAvgLon.toFixed(1)}°E, ${sAvgLat.toFixed(1)}°N)，覆盖 ${second.length} 个网格，峰值距平 ${Math.max(...second.map(p => p.anomaly)).toFixed(2)}°C`
+        })
+      }
+      news.push({
+        time: timeStr,
+        level: maxAnom > 2.0 ? 'danger' : 'warning',
+        text: `最大热浪事件中心 (${avgLon.toFixed(1)}°E, ${avgLat.toFixed(1)}°N)，峰值距平 ${maxAnom.toFixed(2)}°C ${maxAnom > 2.0 ? '⚠ 已达极端热浪等级' : ''}`
+      })
+    } else {
+      news.push({
+        time: timeStr,
+        level: 'normal',
+        text: `当前日期 (${date}) 全球范围未检测到距平 > 1°C 的异常高温点`
+      })
+    }
+    // 始终追加系统更新消息
+    news.push({
+      time: timeStr,
+      level: 'normal',
+      text: `系统已自动更新全球 SST 数据 (${date})`
+    })
+    alertNewsList.value = news
+  } catch (e) {
+    console.error('加载宏观统计数据失败:', e)
+  }
+}
+
+// ---------- 时间滑块 ----------
+function onSliderChange(val) {
+  const date = availableDates.value[val]
+  if (!date) return
+
+  selectedDate.value = date
+  loadSSTHeatmap(date)
+  loadStats(date)
+}
+
+function initTimeSlider() {
+  const range = generateDateRange('2025-07-01', '2025-08-31')
+  availableDates.value = range
+  const idx = range.indexOf(selectedDate.value)
+  timeSliderValue.value = idx >= 0 ? idx : 0
+}
+
 // ---------- 其他 ----------
-function onDateChange(date) { loadSSTHeatmap(date) }
+function onDateChange(date) {
+  loadSSTHeatmap(date)
+  loadStats(date)
+  // 同步滑块位置
+  const idx = availableDates.value.indexOf(date)
+  if (idx >= 0) timeSliderValue.value = idx
+}
 function resetView() { if (view) view.goTo({ center: [122.1, 29.8], zoom: 9 }) }
 
 watch(() => layerControls.showFarming, (v) => { if (farmingLayer) farmingLayer.visible = v })
@@ -310,13 +512,19 @@ onBeforeUnmount(() => {
         <span class="system-title">区域海洋热浪灾害预警平台</span>
       </div>
       <div class="nav-menu-container">
-        <el-menu :default-active="activeMenu" class="top-menu" mode="horizontal" :ellipsis="false">
+        <el-menu :default-active="activeMenu" class="top-menu" mode="horizontal" :ellipsis="false" @select="handleMenuSelect">
           <el-menu-item index="home"><el-icon><House /></el-icon>首页</el-menu-item>
           <el-menu-item index="monitor"><el-icon><MapLocation /></el-icon>热浪监测</el-menu-item>
           <el-sub-menu index="analysis">
             <template #title><el-icon><Warning /></el-icon>灾害分析</template>
-            <el-menu-item index="analysis-1">养殖区空间叠置</el-menu-item>
-            <el-menu-item index="analysis-2">历史溯源</el-menu-item>
+            <el-menu-item index="analysis-1">养殖区缓冲区分析</el-menu-item>
+            <el-menu-item index="analysis-3"> 风险评估 </el-menu-item>
+            
+          </el-sub-menu>
+          <el-sub-menu index="science">
+            <template #title><el-icon><DataAnalysis /></el-icon>科学分析</template>
+            <el-menu-item index="science-1">冷热点分析</el-menu-item>
+            <el-menu-item index="science-2">等温线分析</el-menu-item>
           </el-sub-menu>
           <el-menu-item index="admin"><el-icon><Setting /></el-icon>系统管理</el-menu-item>
         </el-menu>
@@ -343,8 +551,8 @@ onBeforeUnmount(() => {
         <div class="panel-section">
           <h3 class="section-title"><el-icon><DataLine /></el-icon> 宏观监测数据</h3>
           <div class="data-cards">
-            <div class="data-card blue"><span class="card-label">已划定养殖区</span><span class="card-value">12 <small>个</small></span></div>
-            <div class="data-card red"><span class="card-label">活跃热浪预警</span><span class="card-value">3 <small>起</small></span></div>
+            <div class="data-card blue"><span class="card-label">已划定养殖区</span><span class="card-value">{{ farmCount }} <small>个</small></span></div>
+            <div class="data-card red"><span class="card-label">活跃热浪预警</span><span class="card-value">{{ heatAlertCount }} <small>起</small></span></div>
           </div>
         </div>
         <div class="panel-section">
@@ -360,13 +568,35 @@ onBeforeUnmount(() => {
             <el-date-picker v-model="selectedDate" type="date" placeholder="选择日期" format="YYYY-MM-DD" value-format="YYYY-MM-DD" @change="onDateChange" class="dark-date-picker" />
             <p class="date-hint">选择日期后自动加载该日海温距平热力图</p>
           </div>
+          <div v-if="totalSliderDays > 0" class="time-slider-wrap">
+            <div class="slider-header">
+              <span class="slider-label">时间轴浏览</span>
+              <span class="slider-current-date">{{ selectedDate }}</span>
+            </div>
+            <el-slider
+              v-model="timeSliderValue"
+              :min="0"
+              :max="totalSliderDays - 1"
+              :step="1"
+              :format-tooltip="(val) => availableDates[val] || val"
+              @change="onSliderChange"
+              class="time-slider"
+            />
+            <div class="slider-range">
+              <span>{{ availableDates[0] }}</span>
+              <span>{{ availableDates[totalSliderDays - 1] }}</span>
+            </div>
+          </div>
         </div>
         <div class="panel-section flex-fill">
           <h3 class="section-title"><el-icon><Aim /></el-icon> 预警动态摘要</h3>
           <div class="news-list">
-            <div class="news-item danger"><span class="time">10:30</span> 监测到舟山海域水温异常升高...</div>
-            <div class="news-item warning"><span class="time">09:15</span> 台州1号网箱区即将进入波及范围...</div>
-            <div class="news-item normal"><span class="time">08:00</span> 系统自动更新全球SST栅格数据。</div>
+            <div v-for="(item, idx) in alertNewsList" :key="idx" :class="['news-item', item.level]">
+              <span class="time">{{ item.time }}</span> {{ item.text }}
+            </div>
+            <div v-if="alertNewsList.length === 0" class="news-item normal">
+              <span class="time">--</span> 正在加载预警数据...
+            </div>
           </div>
         </div>
       </aside>
@@ -384,6 +614,10 @@ onBeforeUnmount(() => {
     <el-dialog v-model="trendDialogVisible" title="海温距平趋势分析" width="760px" class="trend-dialog" destroy-on-close>
       <div ref="trendChartRef" class="trend-chart"></div>
     </el-dialog>
+
+    <BufferAnalysis ref="bufferAnalysisRef" :date="selectedDate" />
+    <ScientificAnalysis ref="scientificAnalysisRef" :date="selectedDate" />
+    <RiskAssessment ref="riskAssessmentRef" :date="selectedDate" />
   </div>
 </template>
 
@@ -431,6 +665,12 @@ body { margin: 0; padding: 0; overflow: hidden; background-color: #f0f2f5; font-
 .date-picker-wrap { display: flex; flex-direction: column; gap: 8px; }
 .dark-date-picker { width: 100%; }
 .date-hint { font-size: 12px; color: #8499b0; margin: 0; line-height: 1.4; }
+.time-slider-wrap { margin-top: 14px; padding: 10px 0 0; border-top: 1px dashed rgba(132, 153, 176, 0.3); }
+.slider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.slider-label { font-size: 12px; color: #5c6b77; font-weight: 600; }
+.slider-current-date { font-size: 13px; color: #1890ff; font-weight: 700; font-family: monospace; }
+.time-slider { margin: 0 4px; }
+.slider-range { display: flex; justify-content: space-between; font-size: 10px; color: #a0b4c8; margin-top: 4px; font-family: monospace; }
 .news-list { display: flex; flex-direction: column; gap: 12px; }
 .news-item { font-size: 13px; color: #4a5a6a; line-height: 1.6; position: relative; padding-left: 14px; }
 .news-item::before { content: ''; position: absolute; left: 0; top: 7px; width: 6px; height: 6px; border-radius: 50%; }
