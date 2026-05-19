@@ -71,7 +71,7 @@ npm run dev
 养殖区数据需预先导入 farms 或 aquaculture_zone 集合，格式为 GeoJSON FeatureCollection
 
 数据格式示例：
-
+```
 json
 // sst_ocean 集合文档
 {
@@ -93,6 +93,7 @@ json
     "Class": "aquaculture"
   }
 }
+```
 项目结构
 text
 ├── src/
