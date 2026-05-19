@@ -95,6 +95,7 @@ json
 }
 ```
 项目结构
+```
 text
 ├── src/
 │   ├── components/          # Vue 组件（包括 MonitorPage, DecisionPage, 分析工具等）
@@ -107,6 +108,7 @@ text
 │   ├── Analysis.cjs         # 空间分析接口
 │   └── route.cjs            # 路径规划接口
 └── public/
+```
 注意事项
 首次运行可能因缺少底图资源导致地图背景加载失败（需联网或使用可访问 ArcGIS 底图服务的网络）。
 
